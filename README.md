@@ -1,0 +1,208 @@
+# Sim Central Broker
+
+<p align="center">
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-red.svg"></a>
+  <img src="https://img.shields.io/badge/runtime-Cloudflare%20Workers-orange.svg">
+</p>
+
+A small Cloudflare Worker that brokers Discord OAuth2 on behalf of any number of [Nova](https://anodyne-productions.com/nova) sims running the [Sim Central Suite](https://github.com/reecesavage/sim-central-suite). One Discord app, one registered redirect URI, however many sims you like.
+
+## Why this exists
+
+Discord OAuth2 apps cap at 10 redirect URIs each. If you run several sims and want "Sign in with Discord" on each one, you either:
+
+- maintain multiple Discord apps and juggle credentials per sim, **or**
+- run a central broker like this one that handles the OAuth dance for everyone.
+
+The canonical deployment lives at <https://auth.simcentral.host>. The Sim Central Suite ships pointed at it by default. If you'd rather run your own, this repo has everything you need.
+
+## How it works
+
+```
+  ┌─ Sim A ─┐      ┌──────────────────┐      ┌─────────┐
+  │ Login   │─────▶│                  │─────▶│         │
+  │ button  │      │                  │      │ Discord │
+  └─────────┘      │   sim-central-   │◀─────│         │
+       ▲           │     broker       │      └─────────┘
+       │           │                  │
+       └───────────│  one Discord app │
+   signed JWT      │  one redirect    │
+                   │  URI registered  │
+  ┌─ Sim B ─┐      │  with Discord    │
+  │ Login   │─────▶│                  │
+  │ button  │      └──────────────────┘
+  └─────────┘
+       ▲
+       │
+       └─── signed JWT
+```
+
+1. A sim sends the user to `https://auth.simcentral.host/start?return_to=https://your-sim.example.com/discord_auth/callback`.
+2. The broker stashes the `return_to` in Workers KV against a random state token, then redirects the user to Discord's authorize page.
+3. Discord redirects the user back to the broker (`/callback`).
+4. The broker exchanges the code, fetches the user's Discord identity, mints a short-lived JWT signed with its private key, and redirects the user to the original `return_to?token=<JWT>`.
+5. The sim verifies the JWT signature against the broker's public key (baked into the Sim Central Suite, or fetched from `/.well-known/jwks.json`).
+
+The sim never has to register anything with Discord. The broker never has to know which sims exist.
+
+## Endpoints
+
+| Path | Method | Purpose |
+| --- | --- | --- |
+| `/start` | GET | Begins an OAuth flow. Requires `?return_to=<https-or-http url>`. Redirects to Discord. |
+| `/callback` | GET | Discord redirects here. Exchanges code, validates email is verified, mints JWT, redirects to the original `return_to`. |
+| `/.well-known/jwks.json` | GET | Public key in standard JWKS format. Cacheable for an hour. |
+| `/health` | GET | `200 ok`. For uptime monitoring. |
+
+## JWT contents
+
+Signed with **RS256**. Claims:
+
+| Claim | Description |
+| --- | --- |
+| `iss` | Broker base URL (e.g. `https://auth.simcentral.host`) |
+| `aud` | Origin of the original `return_to` &mdash; binds the token to one sim |
+| `sub` | Discord user ID (snowflake, as string) |
+| `username` | Current Discord username |
+| `global_name` | Display name (nullable) |
+| `email` | Discord email address (verified; see below) |
+| `email_verified` | Always `true` &mdash; the broker refuses to mint a JWT for unverified emails |
+| `avatar` | Discord avatar hash (nullable) |
+| `iat` | Issued at (unix seconds) |
+| `exp` | Expires (iat + 300 seconds) |
+
+### Error redirects
+
+When something goes wrong AFTER the state lookup succeeds, the broker redirects to `return_to` with an `?error=` parameter instead of `?token=`. Possible errors:
+
+| Code | Cause |
+| --- | --- |
+| `email_not_verified` | User's Discord email is not verified. They must verify it on Discord first. |
+| `token_exchange_failed` | Discord rejected the authorization code (rare; usually transient). |
+| `identity_fetch_failed` | Discord's `/users/@me` returned non-200 (rare; usually transient). |
+| `missing_code` | Discord redirected without a code (shouldn't happen unless something tampered with the flow). |
+| `access_denied` | User clicked Cancel on Discord's authorize screen. |
+
+When the state lookup itself fails (token missing, expired, or unknown), the broker has no `return_to` to send the user to, so it renders a plain-text error page instead.
+
+## Self-hosting
+
+If you want to run your own broker instead of using `auth.simcentral.host`, the whole setup is about 15 minutes the first time.
+
+### Prerequisites
+
+- A Cloudflare account (the free tier covers this comfortably &mdash; ~100k requests/day)
+- A Discord application (create one at <https://discord.com/developers/applications>)
+- Node.js + npm (to install `wrangler`)
+- A domain or subdomain you control (e.g. `auth.example.com`), proxied through Cloudflare
+
+### Step 1: Generate an RSA keypair
+
+The broker signs JWTs with this private key. The Sim Central Suite verifies them with the public key.
+
+```sh
+openssl genrsa -out priv.pem 2048
+openssl rsa  -in priv.pem -pubout -out pub.pem
+```
+
+Keep `priv.pem` secret. `pub.pem` is the public half &mdash; it goes in your Worker config (and is served from `/.well-known/jwks.json`).
+
+### Step 2: Set up the Discord application
+
+1. Go to <https://discord.com/developers/applications>, create a new app.
+2. **OAuth2 &rarr; Redirects**: add `https://YOUR-BROKER-DOMAIN/callback` (e.g. `https://auth.example.com/callback`). This is the ONE redirect URI you'll ever register.
+3. **OAuth2**: copy the **Client ID** and **Client Secret**.
+
+### Step 3: Clone + configure
+
+```sh
+git clone https://github.com/reecesavage/sim-central-broker
+cd sim-central-broker
+npm install                                  # installs wrangler
+
+cp wrangler.toml.example wrangler.toml       # public config + key bindings
+cp .dev.vars.example    .dev.vars            # local dev secrets only
+```
+
+Edit `wrangler.toml`:
+
+- `DISCORD_CLIENT_ID` &mdash; from step 2
+- `BROKER_BASE_URL` &mdash; the URL where this Worker will live (e.g. `https://auth.example.com`)
+- `JWT_PUBLIC_KEY` &mdash; paste the full contents of `pub.pem` (with the BEGIN/END lines)
+
+### Step 4: Create the KV namespace
+
+```sh
+npx wrangler kv:namespace create STATE_STORE
+```
+
+Copy the returned namespace ID into the `[[kv_namespaces]]` block in `wrangler.toml`.
+
+### Step 5: Deploy
+
+```sh
+npx wrangler deploy
+```
+
+### Step 6: Add the secrets
+
+```sh
+npx wrangler secret put DISCORD_CLIENT_SECRET    # paste the secret from step 2
+npx wrangler secret put JWT_PRIVATE_KEY          # paste the full contents of priv.pem
+```
+
+### Step 7: Wire up the custom domain
+
+In the Cloudflare dashboard:
+
+1. Go to **Workers &amp; Pages &rarr; sim-central-broker &rarr; Settings &rarr; Domains &amp; Routes**.
+2. Add a custom domain matching `BROKER_BASE_URL` (e.g. `auth.example.com`).
+3. Cloudflare handles DNS + SSL automatically as long as the zone is on your Cloudflare account.
+
+### Step 8: Smoke test
+
+```sh
+curl -i "https://YOUR-BROKER-DOMAIN/health"
+# expect: HTTP/2 200, body "ok"
+
+curl -i "https://YOUR-BROKER-DOMAIN/.well-known/jwks.json"
+# expect: HTTP/2 200, JSON with one key in the `keys` array
+
+curl -i "https://YOUR-BROKER-DOMAIN/start?return_to=https://example.com/cb"
+# expect: HTTP/2 302, Location header pointing at discord.com/api/oauth2/authorize?...
+```
+
+If all three work, the broker is live.
+
+## Local development
+
+```sh
+npx wrangler dev
+```
+
+Reads `.dev.vars` for secrets and runs the Worker on `http://localhost:8787`. You can point a test sim at `http://localhost:8787` and run the full OAuth flow locally, provided you've added `http://localhost:8787/callback` to your Discord app's redirect URI list (separate from the production one).
+
+## Tailing logs
+
+```sh
+npx wrangler tail
+```
+
+Streams `console.log` / `console.warn` / `console.error` from the deployed Worker in real time. Useful when debugging a sim that can't complete the flow.
+
+## Security model
+
+| Layer | What it protects |
+| --- | --- |
+| HTTPS (Cloudflare-managed) | Network sniffing of the JWT in transit |
+| Random state token, single-use, 600s TTL | OAuth CSRF; replay of the same callback URL |
+| `aud` claim in JWT | A token issued for Sim A can't be replayed against Sim B |
+| `exp` claim (5 min) | A leaked URL can't be used hours later |
+| Email-verified gate at broker | Unverified Discord accounts can't sign in to any sim using this broker |
+| Cloudflare WAF / rate limiting (optional) | Abusive request floods |
+
+The private key never leaves Cloudflare's secret store. The Discord client secret never leaves Cloudflare's secret store. The repo intentionally contains no credentials.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

@@ -1,0 +1,45 @@
+# Copy to wrangler.toml and fill in the values. wrangler.toml itself is
+# gitignored - this .example file is what's tracked in the repo.
+
+name = "sim-central-broker"
+main = "src/index.js"
+compatibility_date = "2025-05-01"
+
+# Optional: bind a custom domain after first deploy. The canonical
+# broker uses auth.simcentral.host; self-hosters can use whatever they
+# control.
+# routes = [
+#     { pattern = "auth.simcentral.host/*", custom_domain = true }
+# ]
+
+# Public config. Safe to commit. Discord client_id is not a secret -
+# it's visible in every OAuth start URL anyway. The public JWT key is
+# also public by definition.
+[vars]
+DISCORD_CLIENT_ID = "YOUR_DISCORD_APP_CLIENT_ID"
+BROKER_BASE_URL   = "https://auth.simcentral.host"
+JWT_PUBLIC_KEY    = """
+-----BEGIN PUBLIC KEY-----
+PASTE THE CONTENTS OF YOUR pub.pem HERE
+-----END PUBLIC KEY-----
+"""
+
+# Bind the KV namespace that stores per-flow state tokens. Create it
+# once with:
+#   wrangler kv:namespace create STATE_STORE
+# then paste the returned id below.
+[[kv_namespaces]]
+binding = "STATE_STORE"
+id      = "PASTE_KV_NAMESPACE_ID_HERE"
+
+# ----------------------------------------------------------------------
+# Secrets - NOT set here. Set them with `wrangler secret put` AFTER the
+# first successful deploy:
+#
+#   wrangler secret put DISCORD_CLIENT_SECRET
+#   wrangler secret put JWT_PRIVATE_KEY
+#
+# DISCORD_CLIENT_SECRET: copy from your Discord app's OAuth2 page.
+# JWT_PRIVATE_KEY:        paste the full contents of priv.pem (with the
+#                         BEGIN/END lines included).
+# ----------------------------------------------------------------------

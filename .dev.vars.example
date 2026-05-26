@@ -1,0 +1,9 @@
+# Local development secrets. Copy to .dev.vars (which is gitignored)
+# and fill in real values for `wrangler dev` to use.
+#
+# These are the same secrets you'll `wrangler secret put` for production.
+
+DISCORD_CLIENT_SECRET="paste the secret from Discord's OAuth2 page"
+JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----
+PASTE THE CONTENTS OF YOUR priv.pem HERE
+-----END PRIVATE KEY-----"

@@ -1,0 +1,17 @@
+# Real config + secrets - never commit
+wrangler.toml
+.dev.vars
+
+# Generated keys (if you happen to keep them in the working tree)
+*.pem
+*.key
+
+# Wrangler / Cloudflare
+.wrangler/
+node_modules/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
