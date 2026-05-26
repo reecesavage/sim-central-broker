@@ -49,8 +49,8 @@ The sim never has to register anything with Discord. The broker never has to kno
 
 | Path | Method | Purpose |
 | --- | --- | --- |
-| `/start` | GET | Begins an OAuth flow. Requires `?return_to=<https-or-http url>`. Redirects to Discord. |
-| `/callback` | GET | Discord redirects here. Exchanges code, validates email is verified, mints JWT, redirects to the original `return_to`. |
+| `/start` | GET | Begins an OAuth flow. Requires `?return_to=<https-or-http url>`. Optional `?guilds=1` opts into the Discord `guilds` scope (see below). Redirects to Discord. |
+| `/callback` | GET | Discord redirects here. Exchanges code, validates email is verified, fetches guilds if requested, mints JWT, redirects to the original `return_to`. |
 | `/.well-known/jwks.json` | GET | Public key in standard JWKS format. Cacheable for an hour. |
 | `/health` | GET | `200 ok`. For uptime monitoring. |
 
@@ -68,8 +68,20 @@ Signed with **RS256**. Claims:
 | `email` | Discord email address (verified; see below) |
 | `email_verified` | Always `true` &mdash; the broker refuses to mint a JWT for unverified emails |
 | `avatar` | Discord avatar hash (nullable) |
+| `guilds` | *(v1.1.0+ only, when `?guilds=1` was passed on `/start`)* Array of Discord guild ID strings the user is a member of. Just IDs, no names/icons, to keep the JWT compact. |
 | `iat` | Issued at (unix seconds) |
 | `exp` | Expires (iat + 300 seconds) |
+
+### Opting into the guilds scope (v1.1.0+)
+
+When the sim passes `?guilds=1` on `/start`, the broker:
+
+- Adds `guilds` to the OAuth scope, so Discord's consent screen will additionally ask the user to share their server list.
+- After token exchange, calls `/users/@me/guilds` and folds the resulting IDs into the JWT as a `guilds` claim.
+
+Sims that don't pass `?guilds=1` see no change &mdash; same scope (`identify email`), no `guilds` claim, same consent prompt. The flag is opt-in so sims that don't need guild membership checks don't trigger an extra Discord permission prompt for their users.
+
+If `?guilds=1` is passed and the `/users/@me/guilds` fetch fails for any reason, the broker redirects with `?error=guilds_fetch_failed` instead of minting a JWT. Silently downgrading to an empty list would let a user bypass any "must be in our server" check the sim is about to enforce.
 
 ### Error redirects
 
@@ -82,6 +94,7 @@ When something goes wrong AFTER the state lookup succeeds, the broker redirects 
 | `identity_fetch_failed` | Discord's `/users/@me` returned non-200 (rare; usually transient). |
 | `missing_code` | Discord redirected without a code (shouldn't happen unless something tampered with the flow). |
 | `access_denied` | User clicked Cancel on Discord's authorize screen. |
+| `guilds_fetch_failed` | *(v1.1.0+ only)* `?guilds=1` was passed but the `/users/@me/guilds` call failed. Usually transient; user should retry. |
 
 When the state lookup itself fails (token missing, expired, or unknown), the broker has no `return_to` to send the user to, so it renders a plain-text error page instead.
 

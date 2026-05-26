@@ -1,20 +1,20 @@
 {
 	"name": "sim-central-broker",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"private": false,
 	"description": "Cloudflare Worker that brokers Discord OAuth2 for the Sim Central Suite",
 	"main": "src/index.js",
 	"scripts": {
-		"dev":    "wrangler dev",
+		"dev": "wrangler dev",
 		"deploy": "wrangler deploy",
-		"tail":   "wrangler tail"
+		"tail": "wrangler tail"
 	},
 	"devDependencies": {
-		"wrangler": "^3.0.0"
+		"wrangler": "^4.95.0"
 	},
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url":  "https://github.com/reecesavage/sim-central-broker"
+		"url": "https://github.com/reecesavage/sim-central-broker"
 	}
 }

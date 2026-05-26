@@ -32,7 +32,9 @@
 const DISCORD_AUTHORIZE_URL = 'https://discord.com/api/oauth2/authorize';
 const DISCORD_TOKEN_URL     = 'https://discord.com/api/oauth2/token';
 const DISCORD_ME_URL        = 'https://discord.com/api/users/@me';
-const SCOPES                = 'identify email';
+const DISCORD_GUILDS_URL    = 'https://discord.com/api/users/@me/guilds';
+const BASE_SCOPES           = 'identify email';
+const GUILDS_SCOPE          = 'guilds';
 const STATE_TTL_SECONDS     = 600;
 const JWT_TTL_SECONDS       = 300;
 const JWT_KID               = '1';
@@ -65,18 +67,30 @@ async function handleStart(url, env) {
 	}
 	const returnOrigin = new URL(returnTo).origin;
 
+	// Optional: sim asked for the user's guild memberships so it can
+	// enforce a "must be in our Discord server" check. Opt-in via
+	// ?guilds=1 keeps the Discord consent screen unchanged for sims
+	// that don't need this scope.
+	const wantsGuilds = url.searchParams.get('guilds') === '1';
+
 	const state = randomToken(32);
 	await env.STATE_STORE.put(
 		'state:' + state,
-		JSON.stringify({ return_to: returnTo, origin: returnOrigin, created: nowSeconds() }),
+		JSON.stringify({
+			return_to:    returnTo,
+			origin:       returnOrigin,
+			wants_guilds: wantsGuilds,
+			created:      nowSeconds(),
+		}),
 		{ expirationTtl: STATE_TTL_SECONDS }
 	);
 
+	const scope = wantsGuilds ? (BASE_SCOPES + ' ' + GUILDS_SCOPE) : BASE_SCOPES;
 	const params = new URLSearchParams({
 		client_id:     env.DISCORD_CLIENT_ID,
 		redirect_uri:  env.BROKER_BASE_URL + '/callback',
 		response_type: 'code',
-		scope:         SCOPES,
+		scope:         scope,
 		state,
 		prompt:        'consent',
 	});
@@ -104,8 +118,9 @@ async function handleCallback(url, env) {
 	let stored;
 	try { stored = JSON.parse(raw); }
 	catch { return text('corrupt state', 500); }
-	const returnTo = stored.return_to;
-	const audience = stored.origin;
+	const returnTo    = stored.return_to;
+	const audience    = stored.origin;
+	const wantsGuilds = stored.wants_guilds === true;
 
 	// User cancelled / Discord refused before we even got a code.
 	if (denied) {
@@ -135,6 +150,19 @@ async function handleCallback(url, env) {
 		return redirect(appendQuery(returnTo, { error: 'email_not_verified' }));
 	}
 
+	// Optional: fetch the user's guild memberships when the sim asked
+	// for them via ?guilds=1 on /start. Failing this fetch is a hard
+	// fail because the sim is presumably about to enforce a
+	// "must be in our server" check and a missing list would be unsafe
+	// to treat as empty.
+	let guildIds = null;
+	if (wantsGuilds) {
+		guildIds = await fetchGuildIds(tokenRes.access_token);
+		if (guildIds === null) {
+			return redirect(appendQuery(returnTo, { error: 'guilds_fetch_failed' }));
+		}
+	}
+
 	// Mint and hand off the JWT.
 	const now = nowSeconds();
 	const claims = {
@@ -149,6 +177,9 @@ async function handleCallback(url, env) {
 		iat:            now,
 		exp:            now + JWT_TTL_SECONDS,
 	};
+	if (guildIds !== null) {
+		claims.guilds = guildIds;
+	}
 	const jwt = await signJWT(claims, env.JWT_PRIVATE_KEY);
 
 	return redirect(appendQuery(returnTo, { token: jwt }));
@@ -215,6 +246,33 @@ async function fetchUser(accessToken) {
 		return null;
 	}
 	return res.json();
+}
+
+/**
+ * Fetch the user's guild memberships, returning an array of guild ID
+ * strings (the rest of the guild object is discarded to keep the JWT
+ * compact). Returns null on any failure - the caller treats that as a
+ * hard error rather than "user is in zero guilds," since silently
+ * downgrading would let users bypass a "must be in guild X" check.
+ */
+async function fetchGuildIds(accessToken) {
+	const res = await fetch(DISCORD_GUILDS_URL, {
+		headers: { Authorization: 'Bearer ' + accessToken },
+	});
+	if ( ! res.ok) {
+		console.warn('discord users/@me/guilds failed', res.status, await res.text());
+		return null;
+	}
+	let data;
+	try { data = await res.json(); }
+	catch (e) {
+		console.warn('discord users/@me/guilds returned non-JSON', e);
+		return null;
+	}
+	if ( ! Array.isArray(data)) {
+		return null;
+	}
+	return data.map(g => String(g && g.id)).filter(Boolean);
 }
 
 // ---------- JWT (RS256) ----------
