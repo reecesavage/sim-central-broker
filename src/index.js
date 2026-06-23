@@ -35,6 +35,7 @@ const DISCORD_ME_URL        = 'https://discord.com/api/users/@me';
 const DISCORD_GUILDS_URL    = 'https://discord.com/api/users/@me/guilds';
 const BASE_SCOPES           = 'identify email';
 const GUILDS_SCOPE          = 'guilds';
+const GUILD_MEMBER_SCOPE    = 'guilds.members.read';
 const STATE_TTL_SECONDS     = 600;
 const JWT_TTL_SECONDS       = 300;
 const JWT_KID               = '1';
@@ -73,6 +74,13 @@ async function handleStart(url, env) {
 	// that don't need this scope.
 	const wantsGuilds = url.searchParams.get('guilds') === '1';
 
+	// Optional: a consumer (e.g. the moderator dashboard) asks for the user's
+	// ROLES within a specific guild via ?roles_guild=<guild_id>. This adds the
+	// guilds.members.read scope and, on callback, the user's role ids in that
+	// guild land in the JWT. Gated like ?guilds so normal sim sign-in is
+	// unaffected (no extra consent for sims that don't ask).
+	const rolesGuild = (url.searchParams.get('roles_guild') || '').replace(/[^0-9]/g, '');
+
 	const state = randomToken(32);
 	await env.STATE_STORE.put(
 		'state:' + state,
@@ -80,12 +88,16 @@ async function handleStart(url, env) {
 			return_to:    returnTo,
 			origin:       returnOrigin,
 			wants_guilds: wantsGuilds,
+			roles_guild:  rolesGuild || null,
 			created:      nowSeconds(),
 		}),
 		{ expirationTtl: STATE_TTL_SECONDS }
 	);
 
-	const scope = wantsGuilds ? (BASE_SCOPES + ' ' + GUILDS_SCOPE) : BASE_SCOPES;
+	const scopes = [BASE_SCOPES];
+	if (wantsGuilds) { scopes.push(GUILDS_SCOPE); }
+	if (rolesGuild)  { scopes.push(GUILD_MEMBER_SCOPE); }
+	const scope = scopes.join(' ');
 	const params = new URLSearchParams({
 		client_id:     env.DISCORD_CLIENT_ID,
 		redirect_uri:  env.BROKER_BASE_URL + '/callback',
@@ -121,6 +133,7 @@ async function handleCallback(url, env) {
 	const returnTo    = stored.return_to;
 	const audience    = stored.origin;
 	const wantsGuilds = stored.wants_guilds === true;
+	const rolesGuild  = stored.roles_guild || null;
 
 	// User cancelled / Discord refused before we even got a code.
 	if (denied) {
@@ -163,6 +176,18 @@ async function handleCallback(url, env) {
 		}
 	}
 
+	// Optional: the user's role ids within a specific guild (?roles_guild=...).
+	// Not a member of that guild -> empty list (consumer then denies). A hard
+	// fetch error is fatal so the consumer never treats "unknown" as "allowed".
+	let memberRoles = null;
+	if (rolesGuild) {
+		const member = await fetchGuildMember(tokenRes.access_token, rolesGuild);
+		if (member === null) {
+			return redirect(appendQuery(returnTo, { error: 'guild_member_fetch_failed' }));
+		}
+		memberRoles = member.roles;
+	}
+
 	// Mint and hand off the JWT.
 	const now = nowSeconds();
 	const claims = {
@@ -179,6 +204,10 @@ async function handleCallback(url, env) {
 	};
 	if (guildIds !== null) {
 		claims.guilds = guildIds;
+	}
+	if (memberRoles !== null) {
+		claims.roles = memberRoles;
+		claims.roles_guild = String(rolesGuild);
 	}
 	const jwt = await signJWT(claims, env.JWT_PRIVATE_KEY);
 
@@ -273,6 +302,31 @@ async function fetchGuildIds(accessToken) {
 		return null;
 	}
 	return data.map(g => String(g && g.id)).filter(Boolean);
+}
+
+// Fetch the user's member object (incl. role ids) for one guild via the
+// guilds.members.read scope. Returns { roles: string[] }; a 404 means the user
+// isn't in that guild (-> empty roles); null means a hard fetch failure.
+async function fetchGuildMember(accessToken, guildId) {
+	const res = await fetch(
+		'https://discord.com/api/users/@me/guilds/' + encodeURIComponent(guildId) + '/member',
+		{ headers: { Authorization: 'Bearer ' + accessToken } }
+	);
+	if (res.status === 404) {
+		return { roles: [] };
+	}
+	if ( ! res.ok) {
+		console.warn('discord guild member fetch failed', res.status, await res.text());
+		return null;
+	}
+	let data;
+	try { data = await res.json(); }
+	catch (e) {
+		console.warn('discord guild member returned non-JSON', e);
+		return null;
+	}
+	const roles = (data && Array.isArray(data.roles)) ? data.roles.map(String).filter(Boolean) : [];
+	return { roles };
 }
 
 // ---------- JWT (RS256) ----------
