@@ -1,6 +1,6 @@
 {
 	"name": "sim-central-broker",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"private": false,
 	"description": "Cloudflare Worker that brokers Discord OAuth2 for the Sim Central Suite",
 	"main": "src/index.js",

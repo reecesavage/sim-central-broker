@@ -16,9 +16,16 @@
 //   2. Discord redirects user to OUR /callback?code=&state=.
 //      We read+delete the KV entry (single-use), exchange the code at
 //      Discord's token endpoint, fetch /users/@me, then:
-//        - if email not verified  -> 302 return_to?error=email_not_verified
+//        - if the email scope was requested and the email isn't
+//          verified              -> 302 return_to?error=email_not_verified
 //        - otherwise              -> sign an RS256 JWT and
 //                                    302 return_to?token=<JWT>
+//
+// Request versioning: /start?v=2 requests only the identify scope by
+// default; ?email=1 opts back into the email scope (and the
+// email/email_verified JWT claims). Unversioned requests behave exactly
+// as they always have (email scope always requested) so pre-v2
+// consumers keep working untouched; that legacy mode is deprecated.
 //
 //   3. The sim's callback handler verifies the JWT signature against the
 //      broker's public key (baked into the Sim Central Suite or fetched
@@ -33,7 +40,8 @@ const DISCORD_AUTHORIZE_URL = 'https://discord.com/api/oauth2/authorize';
 const DISCORD_TOKEN_URL     = 'https://discord.com/api/oauth2/token';
 const DISCORD_ME_URL        = 'https://discord.com/api/users/@me';
 const DISCORD_GUILDS_URL    = 'https://discord.com/api/users/@me/guilds';
-const BASE_SCOPES           = 'identify email';
+const IDENTIFY_SCOPE        = 'identify';
+const EMAIL_SCOPE           = 'email';
 const GUILDS_SCOPE          = 'guilds';
 const GUILD_MEMBER_SCOPE    = 'guilds.members.read';
 const STATE_TTL_SECONDS     = 600;
@@ -68,6 +76,14 @@ async function handleStart(url, env) {
 	}
 	const returnOrigin = new URL(returnTo).origin;
 
+	// Request version. Unversioned (or ?v=1) requests get the original
+	// behaviour byte-for-byte: the email scope is always requested and
+	// email/email_verified always land in the JWT. ?v=2 requests only
+	// the identify scope unless the consumer opts into email via
+	// ?email=1. v1 is deprecated; consumers should move to v2.
+	const version    = url.searchParams.get('v') === '2' ? 2 : 1;
+	const wantsEmail = version === 2 ? url.searchParams.get('email') === '1' : true;
+
 	// Optional: sim asked for the user's guild memberships so it can
 	// enforce a "must be in our Discord server" check. Opt-in via
 	// ?guilds=1 keeps the Discord consent screen unchanged for sims
@@ -87,6 +103,8 @@ async function handleStart(url, env) {
 		JSON.stringify({
 			return_to:    returnTo,
 			origin:       returnOrigin,
+			version:      version,
+			wants_email:  wantsEmail,
 			wants_guilds: wantsGuilds,
 			roles_guild:  rolesGuild || null,
 			created:      nowSeconds(),
@@ -94,7 +112,8 @@ async function handleStart(url, env) {
 		{ expirationTtl: STATE_TTL_SECONDS }
 	);
 
-	const scopes = [BASE_SCOPES];
+	const scopes = [IDENTIFY_SCOPE];
+	if (wantsEmail)  { scopes.push(EMAIL_SCOPE); }
 	if (wantsGuilds) { scopes.push(GUILDS_SCOPE); }
 	if (rolesGuild)  { scopes.push(GUILD_MEMBER_SCOPE); }
 	const scope = scopes.join(' ');
@@ -132,6 +151,9 @@ async function handleCallback(url, env) {
 	catch { return text('corrupt state', 500); }
 	const returnTo    = stored.return_to;
 	const audience    = stored.origin;
+	// wants_email defaults to true so states minted by an older broker
+	// (in flight across a deploy) keep the legacy v1 behaviour.
+	const wantsEmail  = stored.wants_email !== false;
 	const wantsGuilds = stored.wants_guilds === true;
 	const rolesGuild  = stored.roles_guild || null;
 
@@ -155,11 +177,15 @@ async function handleCallback(url, env) {
 		return redirect(appendQuery(returnTo, { error: 'identity_fetch_failed' }));
 	}
 
-	// Enforce verified email - this is a policy decision baked into the
-	// canonical broker. The suite re-checks email_verified as a safety
-	// net, but failing here means the user never sees a half-completed
-	// sign-up form before getting bounced.
-	if (user.verified !== true) {
+	// Enforce verified email when the email scope was requested. Discord
+	// only exposes the `verified` field under that scope, so a v2 request
+	// without ?email=1 has nothing to check (consumers gating on guild
+	// membership get verification implicitly - Discord requires a
+	// verified email to join most servers). The suite re-checks
+	// email_verified as a safety net when it asks for email; failing here
+	// means the user never sees a half-completed sign-up form before
+	// getting bounced.
+	if (wantsEmail && user.verified !== true) {
 		return redirect(appendQuery(returnTo, { error: 'email_not_verified' }));
 	}
 
@@ -191,17 +217,19 @@ async function handleCallback(url, env) {
 	// Mint and hand off the JWT.
 	const now = nowSeconds();
 	const claims = {
-		iss:            env.BROKER_BASE_URL,
-		aud:            audience,
-		sub:            String(user.id),
-		username:       user.username || null,
-		global_name:    user.global_name || null,
-		email:          user.email || null,
-		email_verified: true,
-		avatar:         user.avatar || null,
-		iat:            now,
-		exp:            now + JWT_TTL_SECONDS,
+		iss:         env.BROKER_BASE_URL,
+		aud:         audience,
+		sub:         String(user.id),
+		username:    user.username || null,
+		global_name: user.global_name || null,
+		avatar:      user.avatar || null,
+		iat:         now,
+		exp:         now + JWT_TTL_SECONDS,
 	};
+	if (wantsEmail) {
+		claims.email          = user.email || null;
+		claims.email_verified = true;
+	}
 	if (guildIds !== null) {
 		claims.guilds = guildIds;
 	}
